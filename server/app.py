@@ -14,11 +14,21 @@ import urllib.request
 import shutil
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
-from tuning import build_tuning_adjust_commands
+from character_set import (
+    CHARACTER_SET_PRESETS,
+    DEFAULT_FLAP_CHARACTER_SET,
+    FLAP_COUNT,
+    CharacterSetError,
+    display_command_for_index,
+    firmware_token_for_glyph,
+    prepare_display_text,
+    validate_character_set,
+)
 from hardware.universal_firmware import (
     UniversalFirmwareError,
     UniversalFirmwareManager,
 )
+from tuning import build_tuning_adjust_commands
 
 try:
     import paho.mqtt.client as mqtt
@@ -165,7 +175,6 @@ def _open_connection():
 ser, SERIAL_PORT = _open_connection()
 
 # --- GLOBAL STATE ---
-FLAP_CHARS = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw"
 current_indices = [-1] * 45  # resized after settings load
 current_display_string = " " * 45
 is_homed = False
@@ -221,6 +230,7 @@ def load_settings():
         "anim_speed":    "0.4",
         "anim_text":     "SPLIT  FLAP  DISPLAY",
         "currency_symbol": "$",
+        "flap_character_set": DEFAULT_FLAP_CHARACTER_SET,
         "saved_playlists": {},
         "livestream_interval": "25",
         "livestream_comments": "",
@@ -280,9 +290,19 @@ def load_settings():
                 defaults.update(data)
                 if "tuned_chars" not in defaults:
                     defaults["tuned_chars"] = {str(i): {} for i in range(45)}
-                return defaults
-        except:
-            pass
+        except Exception as exc:
+            logging.warning(f"Could not load settings from {CONFIG_PATH}: {exc}")
+
+    try:
+        defaults["flap_character_set"] = validate_character_set(
+            defaults.get("flap_character_set", DEFAULT_FLAP_CHARACTER_SET)
+        )
+    except CharacterSetError as exc:
+        logging.warning(
+            f"Invalid saved flap character set; using the standard reel: {exc}"
+        )
+        defaults["flap_character_set"] = DEFAULT_FLAP_CHARACTER_SET
+
     return defaults
 
 def save_settings(data):
@@ -290,6 +310,10 @@ def save_settings(data):
         json.dump(data, f, indent=4)
 
 settings = load_settings()
+
+
+def get_flap_character_set():
+    return settings.get("flap_character_set", DEFAULT_FLAP_CHARACTER_SET)
 
 
 # ============================================================
@@ -305,6 +329,16 @@ def resize_grid():
     n = get_module_count()
     current_indices = [-1] * n
     current_display_string = " " * n
+
+
+def refresh_display_string_from_indices():
+    """Re-label the current physical positions after a character-set change."""
+    global current_display_string
+    flap_characters = get_flap_character_set()
+    current_display_string = "".join(
+        flap_characters[index] if 0 <= index < FLAP_COUNT else " "
+        for index in current_indices
+    )
 
 resize_grid()
 
@@ -1011,48 +1045,47 @@ def get_animation_order(style='ltr', rows=None, cols=None):
 #  DISPLAY
 # ============================================================
 
-COLOR_MAP = {
-    '\U0001f7e5': 'r', '\U0001f7e7': 'o', '\U0001f7e8': 'y', '\U0001f7e9': 'g',
-    '\U0001f7e6': 'b', '\U0001f7ea': 'p', '\u2b1c': 'w', '\u2b1b': ' ',
-}
-
 def send_to_display_sync(text):
     """Send modules staggered so all arrive at their target character simultaneously."""
     global current_indices, current_display_string, is_homed
     if not text:
         return 0
-    clean_text = text.upper()
-    for emoji, char in COLOR_MAP.items():
-        clean_text = clean_text.replace(emoji, char)
-    clean_text = clean_text.replace('"', 'q')
     n = get_module_count()
-    clean_text = clean_text.ljust(n)[:n]
+    flap_characters = get_flap_character_set()
+    clean_text = prepare_display_text(
+        text,
+        flap_characters,
+        n,
+        currency_symbol=settings.get("currency_symbol", "$"),
+    )
     logging.info(f"DISPLAY (sync): {clean_text}")
 
     dists = []
     for i in range(n):
         char = clean_text[i]
-        target_idx = FLAP_CHARS.find(char)
-        if target_idx == -1:
-            target_idx = 0
+        _, target_idx = firmware_token_for_glyph(
+            char,
+            flap_characters,
+        )
         # Treat -1 (pre-home unknown) as position 0 so sync stagger works on first run
         current = 0 if current_indices[i] == -1 else current_indices[i]
-        dist = (target_idx - current) % 64
-        dists.append((i, char, target_idx, dist))
+        dist = (target_idx - current) % FLAP_COUNT
+        dists.append((i, target_idx, dist))
 
-    max_dist = max(d[3] for d in dists) if dists else 0
-    dists_sorted = sorted(dists, key=lambda x: -x[3])
+    max_dist = max(d[2] for d in dists) if dists else 0
+    dists_sorted = sorted(dists, key=lambda x: -x[2])
 
     t0 = time.time()
     with serial_lock:
-        for i, char, target_idx, dist in dists_sorted:
-            delay_before = (max_dist - dist) * (4.0 / 64.0)
+        for i, target_idx, dist in dists_sorted:
+            delay_before = (max_dist - dist) * (4.0 / FLAP_COUNT)
             elapsed = time.time() - t0
             remaining = delay_before - elapsed
             if remaining > 0:
                 time.sleep(remaining)
             if ser and not sim_mode:
-                ser.write(f"m{i:02d}-{char}\n".encode())
+                command = display_command_for_index(i, target_idx, flap_characters)
+                ser.write(f"{command}\n".encode("ascii"))
                 ser.flush()
             current_indices[i] = target_idx
 
@@ -1067,29 +1100,41 @@ def send_to_display_slot(text, effect_speed=80):
     global current_indices, current_display_string, is_homed
     if not text:
         return 0
-    clean_text = text.upper()
-    for emoji, char in COLOR_MAP.items():
-        clean_text = clean_text.replace(emoji, char)
-    clean_text = clean_text.replace('"', 'q')
     n = get_module_count()
-    clean_text = clean_text.ljust(n)[:n]
+    flap_characters = get_flap_character_set()
+    clean_text = prepare_display_text(
+        text,
+        flap_characters,
+        n,
+        currency_symbol=settings.get("currency_symbol", "$"),
+    )
     logging.info(f"DISPLAY (slot): {clean_text}")
 
     # Phase 1: all modules spin to random intermediate chars simultaneously
     # Ensure spin char differs from target so the lock-in is always visible
-    spin_chars = []
+    spin_indices = []
     for i in range(n):
-        target_idx = FLAP_CHARS.find(clean_text[i])
-        if target_idx == -1: target_idx = 0
-        candidates = [c for c in FLAP_CHARS[1:len(FLAP_CHARS)-4] if FLAP_CHARS.find(c) != target_idx]
-        spin_chars.append(random.choice(candidates) if candidates else FLAP_CHARS[1])
+        _, target_idx = firmware_token_for_glyph(
+            clean_text[i],
+            flap_characters,
+        )
+        candidates = [
+            index
+            for index in range(1, FLAP_COUNT - 4)
+            if index != target_idx
+        ]
+        spin_indices.append(random.choice(candidates) if candidates else 1)
     with serial_lock:
         for i in range(n):
             if ser and not sim_mode:
-                ser.write(f"m{i:02d}-{spin_chars[i]}\n".encode())
+                command = display_command_for_index(
+                    i,
+                    spin_indices[i],
+                    flap_characters,
+                )
+                ser.write(f"{command}\n".encode("ascii"))
                 ser.flush()
-            idx = FLAP_CHARS.find(spin_chars[i])
-            current_indices[i] = idx if idx != -1 else 0
+            current_indices[i] = spin_indices[i]
 
     time.sleep(1.5)
 
@@ -1098,14 +1143,16 @@ def send_to_display_slot(text, effect_speed=80):
     with serial_lock:
         for i in range(n):
             char = clean_text[i]
+            _, target_idx = firmware_token_for_glyph(
+                char,
+                flap_characters,
+            )
             if ser and not sim_mode:
-                ser.write(f"m{i:02d}-{char}\n".encode())
+                command = display_command_for_index(i, target_idx, flap_characters)
+                ser.write(f"{command}\n".encode("ascii"))
                 ser.flush()
                 time.sleep(effect_speed / 1000.0)
-            target_idx = FLAP_CHARS.find(char)
-            if target_idx == -1:
-                target_idx = 0
-            dist = (target_idx - current_indices[i]) % 64
+            dist = (target_idx - current_indices[i]) % FLAP_COUNT
             if dist > max_dist:
                 max_dist = dist
             current_indices[i] = target_idx
@@ -1142,23 +1189,15 @@ def send_to_display(text, order=None, raw=False, step_delay_ms=15):
     if not text:
         return 0
 
-    # For normal text: uppercase first (emojis are unaffected by upper()),
-    # then replace emojis with color codes. Animation pages pass raw=True to
-    # skip uppercasing so their color codes (r o y g b p w) stay lowercase.
-    if not raw:
-        clean_text = text.upper()
-    else:
-        clean_text = text
-    for emoji, char in COLOR_MAP.items():
-        clean_text = clean_text.replace(emoji, char)
-    # Apply currency symbol alias: user's currency char → $ (the physical flap position)
-    currency = settings.get('currency_symbol', '$').strip()
-    if currency and currency != '$':
-        clean_text = clean_text.replace(currency.upper(), '$')
-    # The physical " flap is addressed as 'q' in the firmware character map
-    clean_text = clean_text.replace('"', 'q')
     n = get_module_count()
-    clean_text = clean_text.ljust(n)[:n]
+    flap_characters = get_flap_character_set()
+    clean_text = prepare_display_text(
+        text,
+        flap_characters,
+        n,
+        raw=raw,
+        currency_symbol=settings.get("currency_symbol", "$"),
+    )
     logging.info(f"DISPLAY: {clean_text}")
 
     if order is None:
@@ -1176,15 +1215,21 @@ def send_to_display(text, order=None, raw=False, step_delay_ms=15):
             if i >= len(clean_text):
                 continue
             char = clean_text[i]
+            _, target_idx = firmware_token_for_glyph(
+                char,
+                flap_characters,
+            )
             if ser and not sim_mode:
-                ser.write(f"m{i:02d}-{char}\n".encode())
+                command = display_command_for_index(i, target_idx, flap_characters)
+                ser.write(f"{command}\n".encode("ascii"))
                 ser.flush()
                 time.sleep(step_delay_ms / 1000.0)
 
-            target_idx = FLAP_CHARS.find(char)
-            if target_idx == -1:
-                target_idx = 0
-            dist = 128 if current_indices[i] == -1 else (target_idx - current_indices[i]) % 64
+            dist = (
+                FLAP_COUNT * 2
+                if current_indices[i] == -1
+                else (target_idx - current_indices[i]) % FLAP_COUNT
+            )
             if dist > max_dist:
                 max_dist = dist
             current_indices[i] = target_idx
@@ -1539,7 +1584,7 @@ def _show_notify_message(msg):
     order = get_animation_order(msg.get('animation', 'ltr'))
     max_dist = send_to_display(format_lines(*text.split('|')), order)
     last_sent_page = text
-    rotation_time = max_dist * (4.0 / 64.0)
+    rotation_time = max_dist * (4.0 / FLAP_COUNT)
     for _ in range(int(rotation_time * 10)):
         if stop_event.is_set(): return
         time.sleep(0.1)
@@ -1576,7 +1621,7 @@ def _run_app_playlist():
                 max_dist = send_to_display(text, order, step_delay_ms=speed)
                 last_sent_page = text
                 # Wait for rotation + duration
-                rotation_time = max_dist * (4.0 / 64.0)
+                rotation_time = max_dist * (4.0 / FLAP_COUNT)
                 for _ in range(int(rotation_time * 10)):
                     if stop_event.is_set():
                         stop_event.clear()
@@ -1643,7 +1688,7 @@ def _run_app_playlist():
                             max_dist = _send_with_effect(page_text, page_style if not is_anim else anim_style_ap, page_speed, is_anim, app_id=reg)
                             last_sent_page = page_text
 
-                        rotation_time = max_dist * (4.0 / 64.0)
+                        rotation_time = max_dist * (4.0 / FLAP_COUNT)
                         for _ in range(int(rotation_time * 10)):
                             if stop_event.is_set() or time.time() >= deadline: break
                             time.sleep(0.1)
@@ -1889,7 +1934,7 @@ def playlist_loop():
             # Skip rotation wait if manifest opts out (e.g. continuous random spin)
             skip_rot = reg_key in _plugin_registry and _plugin_registry[reg_key].get('skip_rotation_wait')
             if not skip_rot:
-                rotation_time = max_dist * (4.0 / 64.0)
+                rotation_time = max_dist * (4.0 / FLAP_COUNT)
                 for _ in range(int(rotation_time * 10)):
                     if stop_event.is_set(): break
                     time.sleep(0.1)
@@ -2005,12 +2050,23 @@ def current_state():
                    active_app_playlist=active_app_playlist is not None,
                    app_playlist_name=app_playlist_name,
                    rows=get_rows(), cols=get_cols(), sim_mode=sim_mode, hardware_connected=ser is not None,
+                   flap_chars=get_flap_character_set(),
                    transition_style=last_transition_style,
                    transition_speed=last_transition_speed)
 
 @app.route('/grid_config')
 def grid_config():
-    return jsonify(rows=get_rows(), cols=get_cols(), total=get_module_count(), sim_mode=sim_mode)
+    return jsonify(rows=get_rows(), cols=get_cols(), total=get_module_count(),
+                   sim_mode=sim_mode, flap_chars=get_flap_character_set())
+
+
+@app.route('/character_sets')
+def character_sets():
+    return jsonify(
+        count=FLAP_COUNT,
+        active=get_flap_character_set(),
+        presets=CHARACTER_SET_PRESETS,
+    )
 
 @app.route('/toggle_sim', methods=['POST'])
 def toggle_sim():
@@ -2022,20 +2078,38 @@ def toggle_sim():
 def handle_settings():
     global settings, is_homed, current_indices, current_display_string
     if request.method == 'POST':
-        data   = request.json
+        data   = request.get_json(silent=True) or {}
         action = data.get('action')
         mod_id = str(data.get('id', '0'))
 
         if action == 'save_global':
+            if 'flap_character_set' in data:
+                try:
+                    data['flap_character_set'] = validate_character_set(
+                        data['flap_character_set']
+                    )
+                except CharacterSetError as exc:
+                    return jsonify(status="error", message=str(exc)), 400
+
+            character_set_changed = (
+                'flap_character_set' in data
+                and data['flap_character_set'] != get_flap_character_set()
+            )
+            previous_grid = (get_rows(), get_cols())
             # Save any key except internal/protected ones
             protected = {'action', 'id', 'offsets', 'calibrations', 'tuned_chars', 'installed_apps', 'saved_playlists', 'saved_app_playlists'}
             for k, v in data.items():
                 if k not in protected:
                     settings[k] = v
-            if 'sim_rows' in data or 'sim_cols' in data:
+            if (get_rows(), get_cols()) != previous_grid:
                 resize_grid()
+            elif character_set_changed:
+                refresh_display_string_from_indices()
             save_settings(settings)
-            return jsonify(status="Saved")
+            return jsonify(
+                status="Saved",
+                flap_character_set=get_flap_character_set(),
+            )
 
         if action == 'adjust':
             delta      = int(data.get('delta', 0))
@@ -2092,10 +2166,11 @@ def custom_tune():
         step = int(data.get('step', 0))
         idx  = int(data.get('index', 0))
         send_raw(f"m{mod_id:02d}g{step}")
-        if 0 <= idx < len(FLAP_CHARS):
+        flap_characters = get_flap_character_set()
+        if 0 <= idx < FLAP_COUNT:
             current_indices[mod_id] = idx
             sl = list(current_display_string.ljust(get_module_count()))
-            sl[mod_id] = FLAP_CHARS[idx]
+            sl[mod_id] = flap_characters[idx]
             current_display_string = "".join(sl)
 
     elif action == 'save':
@@ -2219,8 +2294,8 @@ def auto_tune_route():
 
     elif action == 'goto_char':
         char_idx = int(data.get('char_index', 0))
-        if 0 <= char_idx < len(FLAP_CHARS):
-            ch = FLAP_CHARS[char_idx]
+        if 0 <= char_idx < FLAP_COUNT:
+            ch = get_flap_character_set()[char_idx]
             # Build 45-char string of the same character and send raw
             # (raw=True so lowercase colour chars are not uppercased)
             text = ch * get_module_count()
@@ -2237,7 +2312,7 @@ def auto_tune_route():
         for mod_id in modules:
             mod_str = str(mod_id)
             cal     = int(settings['calibrations'].get(mod_str, 4096))
-            expected = (char_idx * cal) // 64
+            expected = (char_idx * cal) // FLAP_COUNT
 
             # Current value: tuned if available, else expected
             tuned_val = settings['tuned_chars'].get(mod_str, {}).get(str(char_idx))
@@ -2285,7 +2360,7 @@ def auto_tune_route():
         for i in range(get_module_count()):
             mod_str  = str(i)
             cal      = int(settings['calibrations'].get(mod_str, 4096))
-            expected = (char_idx * cal) // 64
+            expected = (char_idx * cal) // FLAP_COUNT
             tuned    = settings['tuned_chars'].get(mod_str, {}).get(str(char_idx))
             positions[mod_str] = {
                 'expected': expected,
@@ -2300,13 +2375,13 @@ def auto_tune_route():
 @app.route('/tuning_status')
 def tuning_status():
     char_idx = int(request.args.get('char_index', 0))
-    if char_idx < 0 or char_idx >= len(FLAP_CHARS):
+    if char_idx < 0 or char_idx >= FLAP_COUNT:
         return jsonify(status="error", message="Invalid char_index"), 400
     positions = {}
     for i in range(get_module_count()):
         mod_str = str(i)
         cal = int(settings['calibrations'].get(mod_str, 4096))
-        expected = (char_idx * cal) // 64
+        expected = (char_idx * cal) // FLAP_COUNT
         tuned = settings['tuned_chars'].get(mod_str, {}).get(str(char_idx))
         positions[mod_str] = {
             'expected': expected,
@@ -2315,8 +2390,8 @@ def tuning_status():
         }
     return jsonify(
         char_index=char_idx,
-        char=FLAP_CHARS[char_idx],
-        flap_chars=FLAP_CHARS,
+        char=get_flap_character_set()[char_idx],
+        flap_chars=get_flap_character_set(),
         grid={'rows': get_rows(), 'cols': get_cols(), 'total': get_module_count()},
         positions=positions,
     )
@@ -2327,8 +2402,9 @@ def tuning_status():
 @app.route('/backup_settings')
 def backup_settings():
     return jsonify({
-        'version':      1,
+        'version':      2,
         'created':      datetime.now().isoformat(),
+        'flap_character_set': get_flap_character_set(),
         'offsets':      settings['offsets'],
         'calibrations': settings['calibrations'],
         'tuned_chars':  settings['tuned_chars'],
@@ -2339,9 +2415,17 @@ def restore_settings():
     data = request.json
     if not data:
         return jsonify(status="error", message="No data"), 400
+    if 'flap_character_set' in data:
+        try:
+            settings['flap_character_set'] = validate_character_set(
+                data['flap_character_set']
+            )
+        except CharacterSetError as exc:
+            return jsonify(status="error", message=str(exc)), 400
     if 'offsets'      in data: settings['offsets'].update(data['offsets'])
     if 'calibrations' in data: settings['calibrations'].update(data['calibrations'])
     if 'tuned_chars'  in data: settings['tuned_chars'].update(data['tuned_chars'])
+    refresh_display_string_from_indices()
     save_settings(settings)
     hw = False
     if ser:
@@ -2356,7 +2440,11 @@ def restore_settings():
                 if sv != 65535:
                     send_raw(f"m{i:02d}w{idx}:{sv}")
             logging.info(f"Restored m{i:02d}")
-    return jsonify(status="success", hardware_updated=hw, modules_updated=45)
+    return jsonify(
+        status="success",
+        hardware_updated=hw,
+        modules_updated=get_module_count(),
+    )
 
 # ── Saved Playlists ──────────────────────────────────────────
 

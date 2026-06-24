@@ -12,6 +12,7 @@ Built on [Adam G Makes' Split-Flap Display](https://github.com/adamgmakes/SplitF
 - **Playlists** — sequence apps and composed messages with per-entry timing and transitions
 - **Live preview** — animated flap simulation in the browser
 - **Calibration tools** — hardware inspector, auto fine-tune, teach mode
+- **Configurable flap characters** — map any 64-position physical reel, including Unicode symbols such as ↑ and ↓, without changing firmware
 - **Universal Firmware provisioning** — automatically discover, identify, assign, diagnose, and de-provision modules from the calibration page
 - **MQTT** — Home Assistant integration with auto-discovery
 - **Configurable serial port** — auto-detect available ports or enter a custom path; supports env var, settings UI, and Docker deployments
@@ -50,6 +51,25 @@ If no WiFi is available, the Pi creates a hotspot:
 - UI: `http://192.168.4.1`
 
 Configure WiFi from Settings > WiFi / Network in the UI.
+
+## Custom Flap Character Sets
+
+Open **Settings > Flap Character Set** to configure the glyph printed at each
+of the reel's 64 physical positions. Position 0 must be a leading normal space
+for the black/blank flap, and every glyph must be unique.
+
+The built-in **Arrow Reel (↑ / ↓)** preset uses:
+
+```text
+ ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;":%↑.,/?↓roygbpw
+```
+
+Splitflap OS keeps the physical glyph sequence separate from the firmware's
+character map. Custom reels are addressed by numeric position, so entering `↑`
+sends position 51 rather than Unicode bytes. This also prevents multi-byte
+symbols from shifting the color commands at positions 57–63. The firmware does
+not need Unicode glyphs in `FLAP_CHARS`. Character tuning remains position-based,
+and backups include the configured sequence.
 
 ## Updating
 

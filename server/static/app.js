@@ -1,8 +1,10 @@
 // ============================================================
 //  CONSTANTS
 // ============================================================
-// Position 48 is the physical " flap (addressed as 'q' in firmware)
-const CHAR_MAP = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;\":%'.,/?*roygbpw";
+const FLAP_COUNT = 64;
+const DEFAULT_CHAR_MAP = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;\":%'.,/?*roygbpw";
+let CHAR_MAP = Array.from(DEFAULT_CHAR_MAP);
+let characterSetPresets = {};
 
 // How to render characters from the live state string
 const STATE_DISPLAY = {
@@ -89,6 +91,21 @@ let universalProvisioning = {
 let lastFocusedInput = null;
 let lastCursorPos = 0;
 
+function splitFlapInputCharacters(value) {
+  return Array.from(String(value || '').replace(/[\uFE0E\uFE0F]/g, ''));
+}
+
+function setCharacterMap(value) {
+  const characters = Array.from(value || '');
+  if(characters.length !== FLAP_COUNT || characters[0] !== ' ') return false;
+  if(CHAR_MAP.join('') === characters.join('')) return true;
+  CHAR_MAP = characters;
+  Object.values(liveFlaps).flat().forEach(flap=>flap._render(CHAR_MAP[flap.curIdx] || ' '));
+  if(globalSettings) globalSettings.flap_character_set = characters.join('');
+  if(document.getElementById('charMatrix') && globalSettings) renderCharGrid();
+  return true;
+}
+
 // ============================================================
 //  TOAST
 // ============================================================
@@ -131,7 +148,7 @@ class LiveFlap {
       return;
     }
     this.busy = true;
-    const next = (this.curIdx + 1) % 64;
+    const next = (this.curIdx + 1) % FLAP_COUNT;
     this._flip(CHAR_MAP[this.curIdx], CHAR_MAP[next], () => { this.curIdx = next; this._render(CHAR_MAP[next]); this._step(); });
   }
   _render(ch) {
@@ -280,6 +297,7 @@ function initLiveGrids(rows, cols) {
 (async function(){
   try {
     const cfg = await fetch('/grid_config').then(r=>r.json());
+    if(cfg.flap_chars) setCharacterMap(cfg.flap_chars);
     initLiveGrids(cfg.rows || 3, cfg.cols || 15);
     initComposeGrid();
     simMode = cfg.sim_mode !== false;
@@ -324,7 +342,8 @@ setInterval(()=>{
     }
 
     // Animated live display (single grid)
-    const s = data.state || '';
+    if(data.flap_chars) setCharacterMap(data.flap_chars);
+    const s = Array.from(data.state || '');
     const fa = liveFlaps['control'];
     liveTransitionStyle = data.transition_style || 'ltr';
     liveTransitionSpeed = data.transition_speed || 15;
@@ -335,7 +354,7 @@ setInterval(()=>{
         const flipTime = liveFlipSpeedMs * 2;
         const dists = fa.map((f, i) => {
           const tgt = CHAR_MAP.indexOf(s[i] || ' ');
-          return tgt >= 0 ? (tgt - f.curIdx + 64) % 64 : 0;
+          return tgt >= 0 ? (tgt - f.curIdx + FLAP_COUNT) % FLAP_COUNT : 0;
         });
         const maxDist = Math.max(...dists, 0);
         fa.forEach((f, i) => {
@@ -343,12 +362,14 @@ setInterval(()=>{
           f.setTarget(tgt >= 0 ? tgt : 0, (maxDist - dists[i]) * flipTime);
         });
       } else if(style === 'slot'){
-        const SLOT_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
         const targets = fa.map((_, i) => { const t = CHAR_MAP.indexOf(s[i] || ' '); return t >= 0 ? t : 0; });
+        const spinPool = Array.from(
+          {length: FLAP_COUNT - 5},
+          (_, index)=>index + 1
+        );
         fa.forEach((f, i) => {
-          let spin;
-          do { spin = CHAR_MAP.indexOf(SLOT_CHARS[Math.floor(Math.random()*SLOT_CHARS.length)]); }
-          while(spin === targets[i]);
+          const candidates = spinPool.filter(index=>index !== targets[i]);
+          const spin = candidates[Math.floor(Math.random() * candidates.length)] || 1;
           f.setTarget(spin, 0);
         });
         setTimeout(() => { fa.forEach((f, i) => f.setTarget(targets[i], i * speed)); }, 1500);
@@ -520,13 +541,26 @@ function createComposeGrid(container, opts={}){
 
   const palette = document.createElement('div');
   palette.className = 'color-palette';
-  ['🟥','🟧','🟨','🟩','🟦','🟪','⬜','⬛'].forEach(emoji=>{
+  const colorChoices = [
+    ['🟥','r'], ['🟧','o'], ['🟨','y'], ['🟩','g'],
+    ['🟦','b'], ['🟪','p'], ['⬜','w'], ['⬛',' '],
+  ];
+  colorChoices.filter(([, glyph])=>CHAR_MAP.includes(glyph)).forEach(([emoji])=>{
     const btn = document.createElement('button');
     btn.className = 'color-btn';
     btn.textContent = emoji;
     btn.onclick = ()=> doInsertColor(emoji);
     palette.appendChild(btn);
   });
+  CHAR_MAP.filter(ch=>ch !== ' ' && ch.codePointAt(0) > 126).forEach(glyph=>{
+    const btn = document.createElement('button');
+    btn.className = 'color-btn';
+    btn.textContent = glyph;
+    btn.title = `Insert ${glyph}`;
+    btn.onclick = ()=> doInsertGlyph(glyph);
+    palette.appendChild(btn);
+  });
+  if(!palette.childElementCount) palette.style.display = 'none';
 
   wrapper.appendChild(gridWrap);
   wrapper.appendChild(capture);
@@ -560,7 +594,7 @@ function createComposeGrid(container, opts={}){
 
   function setText(text){
     buffer = Array(total).fill(' ');
-    const chars = Array.from(text);
+    const chars = splitFlapInputCharacters(text);
     for(let i=0; i<Math.min(chars.length, total); i++) buffer[i] = chars[i] || ' ';
     render();
   }
@@ -593,6 +627,15 @@ function createComposeGrid(container, opts={}){
     if(cursor < 0) cursor = 0;
     activeGridInstance = instance;
     buffer[cursor] = emoji;
+    if(cursor < total-1) cursor++;
+    render();
+    capture.focus();
+  }
+
+  function doInsertGlyph(glyph){
+    if(cursor < 0) cursor = 0;
+    activeGridInstance = instance;
+    buffer[cursor] = glyph;
     if(cursor < total-1) cursor++;
     render();
     capture.focus();
@@ -644,7 +687,7 @@ function createComposeGrid(container, opts={}){
     if(activeGridInstance !== instance || cursor < 0) return;
     const val = capture.value;
     if(val.length > 0){
-      const chars = Array.from(val);
+      const chars = splitFlapInputCharacters(val);
       chars.forEach(ch => {
         if(cursor < total){
           buffer[cursor] = ch.toUpperCase();
@@ -2059,6 +2102,14 @@ function loadSettingsData(){
     // Currency symbol
     const currencyEl = document.getElementById('currencySymbol');
     if(currencyEl) currencyEl.value = data.currency_symbol || '$';
+    // Physical flap glyph sequence
+    const characterSetEl = document.getElementById('flapCharacterSet');
+    if(characterSetEl){
+      characterSetEl.value = data.flap_character_set || DEFAULT_CHAR_MAP;
+      updateCharacterSetEditor(false);
+      loadCharacterSetPresets();
+    }
+    setCharacterMap(data.flap_character_set || DEFAULT_CHAR_MAP);
     // Transition style settings
     const transStyle = document.getElementById('transitionStyle');
     if(transStyle){
@@ -2650,11 +2701,11 @@ function renderCharGrid(){
   grid.innerHTML='';
   const COLOR_DISP={'r':'🟥','o':'🟧','y':'🟨','g':'🟩','b':'🟦','p':'🟪','w':'⬜',' ':'⬛'};
   const tuned=globalSettings.tuned_chars[selectedModule.toString()]||{};
-  for(let i=0;i<64;i++){
+  const totalSteps = parseInt(globalSettings.calibrations[selectedModule.toString()] || 4096);
+  for(let i=0;i<FLAP_COUNT;i++){
     const ch=CHAR_MAP[i];
-    // " is shown as " (it's position 48, was 'q')
     const disp=COLOR_DISP[ch]||ch;
-    const expected=i*64;
+    const expected=Math.floor((i * totalSteps) / FLAP_COUNT);
     const isTuned=tuned[i.toString()]!==undefined;
     const actual=isTuned?tuned[i.toString()]:expected;
     const cell=document.createElement('div');
@@ -2832,7 +2883,80 @@ document.addEventListener('DOMContentLoaded', ()=>{
   });
 });
 
-function saveGlobal(){
+function validateCharacterSetInput(value){
+  const characters = Array.from(value || '');
+  if(characters.length !== FLAP_COUNT){
+    return {valid:false, characters, message:`Exactly ${FLAP_COUNT} characters are required.`};
+  }
+  if(characters[0] !== ' '){
+    return {valid:false, characters, message:'Character 0 must be a normal space (the black/blank flap).'};
+  }
+  if(characters.some(ch=>/[\u0000-\u001f\u007f-\u009f]/.test(ch))){
+    return {valid:false, characters, message:'Line breaks, tabs, and control characters are not allowed.'};
+  }
+  const seen = new Set();
+  const duplicates = [];
+  characters.forEach(ch=>{
+    if(seen.has(ch) && !duplicates.includes(ch)) duplicates.push(ch);
+    seen.add(ch);
+  });
+  if(duplicates.length){
+    const labels = duplicates.map(ch=>ch === ' ' ? 'space' : `"${ch}"`).join(', ');
+    return {valid:false, characters, message:`Every position must be unique. Duplicate: ${labels}.`};
+  }
+  return {valid:true, characters, message:'Valid 64-position character set.'};
+}
+
+function updateCharacterSetEditor(markDirty=true){
+  const input = document.getElementById('flapCharacterSet');
+  const status = document.getElementById('characterSetStatus');
+  const preview = document.getElementById('characterSetPreview');
+  if(!input || !status || !preview) return null;
+
+  const result = validateCharacterSetInput(input.value);
+  status.textContent = `${result.characters.length}/${FLAP_COUNT} — ${result.message}`;
+  status.className = `character-set-status ${result.valid ? 'valid' : 'invalid'}`;
+
+  preview.innerHTML = '';
+  result.characters.slice(0, FLAP_COUNT).forEach((ch, index)=>{
+    const cell = document.createElement('div');
+    cell.className = 'character-set-cell';
+    const display = STATE_DISPLAY[ch] || (ch === ' ' ? '␠' : ch);
+    const indexEl = document.createElement('span');
+    indexEl.className = 'character-set-index';
+    indexEl.textContent = index;
+    const glyphEl = document.createElement('span');
+    glyphEl.className = 'character-set-glyph';
+    glyphEl.textContent = display;
+    cell.append(indexEl, glyphEl);
+    preview.appendChild(cell);
+  });
+  if(markDirty) setSettingsDirty(true);
+  return result;
+}
+
+async function loadCharacterSetPresets(){
+  if(Object.keys(characterSetPresets).length) return;
+  try {
+    const data = await fetch('/character_sets').then(r=>r.json());
+    characterSetPresets = data.presets || {};
+  } catch(e) {
+    characterSetPresets = {
+      standard:{characters:DEFAULT_CHAR_MAP},
+    };
+  }
+}
+
+async function useCharacterSetPreset(name){
+  await loadCharacterSetPresets();
+  const preset = characterSetPresets[name];
+  const input = document.getElementById('flapCharacterSet');
+  if(!preset || !input) return;
+  input.value = preset.characters;
+  updateCharacterSetEditor(true);
+}
+
+async function saveGlobal(){
   const rows = parseInt(document.getElementById('simRows').value) || 3;
   const cols = parseInt(document.getElementById('simCols').value) || 15;
   const globalDelay = parseInt(document.getElementById('globalLoopDelay').value) || 5;
@@ -2841,7 +2965,19 @@ function saveGlobal(){
   const locLat = document.getElementById('globalLocationLat')?.value || '';
   const locLon = document.getElementById('globalLocationLon')?.value || '';
   const locName = document.getElementById('globalLocationName')?.value || '';
-  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+  const characterSetEl = document.getElementById('flapCharacterSet');
+  const characterSetResult = validateCharacterSetInput(
+    characterSetEl?.value || DEFAULT_CHAR_MAP
+  );
+  if(!characterSetResult.valid){
+    updateCharacterSetEditor(false);
+    characterSetEl?.focus();
+    showToast(characterSetResult.message, 'error');
+    return;
+  }
+
+  try {
+    const response = await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
     action:'save_global',
     sim_rows:rows, sim_cols:cols,
     global_loop_delay: globalDelay,
@@ -2857,10 +2993,15 @@ function saveGlobal(){
     notify_enabled: document.getElementById('notifyEnabled').checked,
     notify_display_seconds: parseInt(document.getElementById('notifyDisplaySeconds').value) || 10,
     currency_symbol: document.getElementById('currencySymbol')?.value || '$',
+    flap_character_set: characterSetResult.characters.join(''),
     transition_style: document.getElementById('transitionStyle') ? document.getElementById('transitionStyle').value : 'ltr',
     transition_speed: parseInt(document.getElementById('transitionSpeed') ? document.getElementById('transitionSpeed').value : 15) || 15,
-  })}).then(()=>{
-    initLiveGrids(rows, cols);
+    })});
+    const data = await response.json();
+    if(!response.ok) throw new Error(data.message || 'Could not save settings');
+
+    setCharacterMap(data.flap_character_set || characterSetResult.characters.join(''));
+    if(rows !== liveGridRows || cols !== liveGridCols) initLiveGrids(rows, cols);
     buildAppsGrid(); // re-check compatibility after grid change
     initComposeGrid(); // resize compose grid to match new dimensions
     showToast('Settings saved');
@@ -2869,7 +3010,9 @@ function saveGlobal(){
     if(document.getElementById('mqttEnabled').checked){
       fetch('/mqtt_reconnect',{method:'POST'});
     }
-  });
+  } catch(error) {
+    showToast(error.message || 'Could not save settings', 'error');
+  }
 }
 
 function updateTransitionSpeedDefault(style){
@@ -2927,7 +3070,7 @@ function uploadBackup(input){
 // ============================================================
 const at = {
   active: false,
-  charIndex: 63,
+  charIndex: FLAP_COUNT - 1,
   phase: 'ahead',     // 'ahead' | 'behind' | 'verify'
   selected: new Set(),
   positions: {},       // module positions from server
@@ -2957,7 +3100,7 @@ function closeAutoTune(){
 async function atBegin(){
   const startIdx = parseInt(document.getElementById('atStartIdx').value) || 1;
   const stepSize = parseInt(document.getElementById('atStepSize').value) || 25;
-  at.charIndex = Math.max(1, Math.min(63, startIdx));
+  at.charIndex = Math.max(1, Math.min(FLAP_COUNT - 1, startIdx));
 
   // Show homing screen
   document.getElementById('atStart').style.display='none';
@@ -3002,7 +3145,7 @@ async function atGoToChar(idx){
   document.getElementById('atCharBox').textContent = ch;
   document.getElementById('atCharBox').title = `Index ${idx}: "${CHAR_MAP[idx]}"`;
   document.getElementById('atProgressText').textContent =
-    `Character ${idx} of 63 — Index ${idx} — "${CHAR_MAP[idx]}"`;
+    `Character ${idx} of ${FLAP_COUNT - 1} — Index ${idx} — "${CHAR_MAP[idx]}"`;
 
   // Send all modules to this character
   await fetch('/auto_tune', {
@@ -3056,7 +3199,7 @@ function atRenderPhase(){
 
   // Get neighboring char names for instructions
   const prevChar = at.charIndex > 0 ? charDisplay(at.charIndex - 1) : '?';
-  const nextChar = at.charIndex < 63 ? charDisplay(at.charIndex + 1) : '?';
+  const nextChar = at.charIndex < FLAP_COUNT - 1 ? charDisplay(at.charIndex + 1) : '?';
   const curChar = charDisplay(at.charIndex);
 
   if(at.phase === 'ahead'){
@@ -3164,7 +3307,7 @@ function atSkipToPhase(phase){
 
 function atNextChar(){
   const next = at.charIndex + 1;
-  if(next > 63){
+  if(next > FLAP_COUNT - 1){
     // Done!
     document.getElementById('atActive').style.display='none';
     document.getElementById('atDone').style.display='block';
@@ -3175,7 +3318,7 @@ function atNextChar(){
 
 function atJumpTo(val){
   const idx = parseInt(val);
-  if(idx >= 1 && idx <= 63){
+  if(idx >= 1 && idx <= FLAP_COUNT - 1){
     atGoToChar(idx);
   }
 }
@@ -3238,9 +3381,9 @@ async function tmGoToChar(idx){
 
   document.getElementById('tmPrevBtn').disabled = (idx === 0);
 
-  const pct = ((idx / 63) * 100).toFixed(0);
+  const pct = ((idx / (FLAP_COUNT - 1)) * 100).toFixed(0);
   document.getElementById('tmProgressFill').style.width = pct + '%';
-  document.getElementById('tmProgressText').textContent = `Character ${idx} of 63`;
+  document.getElementById('tmProgressText').textContent = `Character ${idx} of ${FLAP_COUNT - 1}`;
 
   const ch = charDisplay(idx);
   document.getElementById('tmCharBox').textContent = ch;
@@ -3306,11 +3449,11 @@ async function tmNudge(multiplier){
 }
 
 function tmNext(){
-  if(tm.charIdx >= 63){
+  if(tm.charIdx >= FLAP_COUNT - 1){
     document.getElementById('tmActive').style.display='none';
     document.getElementById('tmDone').style.display='block';
     document.getElementById('tmSummary').textContent =
-      `Adjusted ${tm.adjustedChars.size} of 64 characters.`;
+      `Adjusted ${tm.adjustedChars.size} of ${FLAP_COUNT} characters.`;
     return;
   }
   tmGoToChar(tm.charIdx + 1);
